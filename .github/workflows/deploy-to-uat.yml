@@ -14,9 +14,11 @@ jobs:
       github.actor != 'dependabot-preview[bot]' &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on:
-    - tazama-uat
+    - ${{ vars.RUNNER_LABEL || 'tazama-uat' }}
     env:
       RULE_NAME: ${{ github.event.repository.name }}
+      ORG: ${{ github.repository_owner }}
+      SERVER_IP: ${{ vars.SERVER_IP || '10.10.80.37' }}
 
     steps:
       # Step 1: Checkout repository
@@ -33,7 +35,7 @@ jobs:
       - name: Clone Rule Executer Repo
         run: |
           echo "Cloning Rule Executer repo and removing package-lock.json file..."
-          git clone https://github.com/tazama-lf/rule-executer -b feat-paysys
+          git clone https://github.com/tazama-lf/rule-executer -b dev
           cd rule-executer 
           rm -f package-lock.json
           cd ..
@@ -56,20 +58,43 @@ jobs:
           echo "RULE_ID=$RULE_ID" >> $GITHUB_ENV
           echo "Normalized RULE_ID=$RULE_ID"
 
-      - name: Modify Rule Executer Files
+      - name: Modify Rule Executer Dockerfile
+        shell: bash
         run: |
-          echo "Modifying rule-executer-$RULE_NAME files..."
-          # Update rule dependency to use @latest
-          sed -i 's|"rule": "npm:@psl-copilot/rule-placeholder@latest"|"rule": "npm:@psl-copilot/'"$RULE_NAME"'@latest"|g' rule-executer-$RULE_NAME/package.json
+          set -euo pipefail
 
-          # Update rule number in Dockerfile
-          sed -i "s/placeholder/$RULE_ID/" rule-executer-$RULE_NAME/Dockerfile
+          DOCKERFILE="rule-executer-$RULE_NAME/Dockerfile"
 
-          # Modify Dockerfile to accept GH_TOKEN and configure npm before npm ci
-          sed -i '/^FROM node/a\ARG GH_TOKEN' rule-executer-$RULE_NAME/Dockerfile
-          sed -i '/^RUN npm ci/i\RUN echo "@tazama-lf:registry=https://npm.pkg.github.com" > /root/.npmrc && \\\n    echo "@psl-copilot:registry=https://npm.pkg.github.com" >> /root/.npmrc && \\\n    echo "//npm.pkg.github.com/:_authToken=${GH_TOKEN}" >> /root/.npmrc\n' rule-executer-$RULE_NAME/Dockerfile
-          echo "Successfully modified rule-executer-$RULE_NAME files."
+          echo "Patching $DOCKERFILE..."
+
+          # Ensure BuildKit syntax supported by the self-hosted runner.
+          sed -i '/^# syntax=docker\/dockerfile:/d' "$DOCKERFILE"
+          sed -i '1i# syntax=docker/dockerfile:1.4' "$DOCKERFILE"
+
+          # Replace rule placeholder.
+          sed -i "s/placeholder/$RULE_ID/g" "$DOCKERFILE"
+
+          # Fix builder installation.
+          sed -i \
+            's|RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN npm ci --ignore-scripts|RUN --mount=type=secret,id=GH_TOKEN,required=true GH_TOKEN="$(cat /run/secrets/GH_TOKEN)" npm ci --ignore-scripts|' \
+            "$DOCKERFILE"
+
+          # Fix production dependency installation.
+          sed -i \
+            's|RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN npm ci --omit=dev --ignore-scripts|RUN --mount=type=secret,id=GH_TOKEN,required=true GH_TOKEN="$(cat /run/secrets/GH_TOKEN)" npm ci --omit=dev --ignore-scripts|' \
+            "$DOCKERFILE"
+
+          echo "Dockerfile after patch:"
+          grep -n -A2 -B2 'npm ci' "$DOCKERFILE"
           
+      - name: Update Rule Dependency Name
+        run: |
+          echo "Updating rule dependency to @$ORG/$RULE_NAME@latest..."
+          cd rule-executer-$RULE_NAME
+          npm pkg delete dependencies.rule
+          npm pkg set "dependencies.rule=npm:@$ORG/$RULE_NAME@latest"
+          echo "Rule dependency updated."
+
       # Verify Changes in modified files
       - name: Verify Changes
         run: |
@@ -78,16 +103,20 @@ jobs:
       
       # Configure npm for GitHub Packages
       - name: Configure npm for GitHub Packages
-        run: |
-          export NPMRC_PATH="$HOME/.npmrc"
-          echo "@tazama-lf:registry=https://npm.pkg.github.com" >  "$NPMRC_PATH"
-          echo "@psl-copilot:registry=https://npm.pkg.github.com" >> "$NPMRC_PATH"
-          echo "//npm.pkg.github.com/:_authToken=${GH_TOKEN}" >> "$NPMRC_PATH"
-
-          echo "=== ACTIVE npmrc ==="
-          cat "$NPMRC_PATH"
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.TAZAMA_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          cat > "$HOME/.npmrc" <<EOF
+          @tazama-lf:registry=https://npm.pkg.github.com
+          @$ORG:registry=https://npm.pkg.github.com
+          //npm.pkg.github.com/:_authToken=\${GH_TOKEN}
+          always-auth=true
+          EOF
+
+          cp "$HOME/.npmrc" "rule-executer-$RULE_NAME/.npmrc"
 
       - name: Generate package-lock.json for Docker build
         run: |
@@ -101,7 +130,7 @@ jobs:
         run: |
           cd rule-executer-$RULE_NAME
           npm pkg delete dependencies.rule
-          npm install --save-exact rule@npm:@psl-copilot/$RULE_NAME@latest --ignore-scripts
+          npm install --save-exact rule@npm:@$ORG/$RULE_NAME@latest --ignore-scripts
           echo "✅ Installed: $(npm list rule --depth=0)"
         env:
           GH_TOKEN: ${{ secrets.TAZAMA_TOKEN }}
@@ -115,9 +144,15 @@ jobs:
 
       # Step 6: Build Docker Image and Deploy Container Locally
       - name: Build Docker Image and Deploy Container Locally
+        shell: bash
         run: |
+          set -euo pipefail
+
           echo "Building Docker image locally on self-hosted runner..."
-          docker build --build-arg GH_TOKEN=${GH_TOKEN} -t psl-copilot/$RULE_NAME:latest rule-executer-$RULE_NAME
+          docker build \
+            --secret id=GH_TOKEN,env=GH_TOKEN \
+            -t "$ORG/$RULE_NAME:latest" \
+            "rule-executer-$RULE_NAME"
           echo "Docker Image build complete."
           
           echo "Stopping and removing existing container if running..."
@@ -129,32 +164,32 @@ jobs:
           -e RULE_NAME=$RULE_ID \
           -e RULE_VERSION=1.0.0 \
           -e RAW_HISTORY_DATABASE=raw_history \
-          -e RAW_HISTORY_DATABASE_HOST=10.10.80.37 \
+          -e RAW_HISTORY_DATABASE_HOST=$SERVER_IP \
           -e RAW_HISTORY_DATABASE_PORT=5432 \
           -e RAW_HISTORY_DATABASE_USER=postgres \
           -e RAW_HISTORY_DATABASE_PASSWORD=postgres \
           -e RAW_HISTORY_DATABASE_CERT_PATH=/usr/local/share/ca-certificates/ca-certificates.crt \
           -e CONFIGURATION_DATABASE=configuration \
-          -e CONFIGURATION_DATABASE_HOST=10.10.80.37 \
+          -e CONFIGURATION_DATABASE_HOST=$SERVER_IP \
           -e CONFIGURATION_DATABASE_PORT=5432 \
           -e CONFIGURATION_DATABASE_USER=postgres \
           -e CONFIGURATION_DATABASE_PASSWORD=postgres \
           -e CONFIGURATION_DATABASE_CERT_PATH=/usr/local/share/ca-certificates/ca-certificates.crt \
           -e EVENT_HISTORY_DATABASE=event_history \
-          -e EVENT_HISTORY_DATABASE_HOST=10.10.80.37 \
+          -e EVENT_HISTORY_DATABASE_HOST=$SERVER_IP \
           -e EVENT_HISTORY_DATABASE_PORT=5432 \
           -e EVENT_HISTORY_DATABASE_USER=postgres \
           -e EVENT_HISTORY_DATABASE_PASSWORD=postgres \
           -e EVENT_HISTORY_DATABASE_CERT_PATH=/usr/local/share/ca-certificates/ca-certificates.crt \
           -e STARTUP_TYPE=nats \
-          -e SERVER_URL=10.10.80.37:14222 \
+          -e SERVER_URL=$SERVER_IP:14222 \
           -e PRODUCER_STREAM= \
           -e CONSUMER_STREAM= \
           -e STREAM_SUBJECT= \
           -e ACK_POLICY=Explicit \
           -e PRODUCER_STORAGE=File \
           -e PRODUCER_RETENTION_POLICY=Workqueue \
-          --restart unless-stopped psl-copilot/$RULE_NAME:latest
+          --restart unless-stopped $ORG/$RULE_NAME:latest
           
           echo "Container deployed successfully."
         env:
