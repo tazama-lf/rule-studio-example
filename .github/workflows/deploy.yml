@@ -21,6 +21,8 @@ jobs:
       RULE_NAME: ${{ github.event.repository.name }}
       ORG: ${{ github.repository_owner }}
       SERVER_IP: ${{ vars.SERVER_IP || '10.10.80.18' }}
+      # Branch or tag of tazama-lf/rule-executer the image is built from
+      RULE_EXECUTER_REF: ${{ vars.RULE_EXECUTER_REF || 'dev' }}
 
     steps:
       # Step 1: Checkout repository
@@ -37,7 +39,7 @@ jobs:
       - name: Clone Rule Executer Repo
         run: |
           echo "Cloning Rule Executer repo and removing package-lock.json file..."
-          git clone https://github.com/tazama-lf/rule-executer -b dev
+          git clone https://github.com/tazama-lf/rule-executer -b "$RULE_EXECUTER_REF"
           cd rule-executer 
           rm -f package-lock.json
           cd ..
@@ -118,7 +120,9 @@ jobs:
           always-auth=true
           EOF
 
-          cp "$HOME/.npmrc" "rule-executer-$RULE_NAME/.npmrc"
+      - name: Add org scope to rule-executer .npmrc so npm ci can resolve the published rule package
+        run: |
+          echo "@${ORG}:registry=https://npm.pkg.github.com" >> rule-executer-$RULE_NAME/.npmrc
 
       - name: Generate package-lock.json for Docker build
         run: |
